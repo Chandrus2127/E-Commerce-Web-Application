@@ -57,7 +57,7 @@ const Checkout = () => {
     fetchCart();
   }, [user, buyNowItem, navigate]);
 
-   /* ---------------- Razorpay ---------------- */
+  /* ---------------- Razorpay Loader ---------------- */
   const loadRazorpay = () =>
     new Promise((resolve) => {
       const script = document.createElement("script");
@@ -66,6 +66,76 @@ const Checkout = () => {
       document.body.appendChild(script);
     });
 
+  /* ---------------- Persist Address ---------------- */
+  useEffect(() => {
+    localStorage.setItem("shippingAddress", JSON.stringify(shippingAddress));
+  }, [shippingAddress]);
+
+  /* ---------------- Source of Truth ---------------- */
+  const checkoutItems = useMemo(() => {
+    if (buyNowItem) {
+      return [
+        {
+          product: buyNowItem.product,
+          qty: buyNowItem.qty,
+        },
+      ];
+    }
+    return cartItems;
+  }, [buyNowItem, cartItems]);
+
+  const itemsPrice = checkoutItems.reduce(
+    (sum, item) => sum + item.product.price * item.qty,
+    0
+  );
+
+  const shippingPrice = itemsPrice > 1000 ? 0 : 50;
+  const totalPrice = itemsPrice + shippingPrice;
+
+  /* ---------------- Place Order (Backend Call) ---------------- */
+  const submitHandler = async (e) => {
+    e.preventDefault();
+
+    if (checkoutItems.length === 0) return;
+
+    setPlacingOrder(true);
+
+    try {
+      const res = await fetch("http://localhost:5000/api/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${user.token}`,
+        },
+        body: JSON.stringify({
+          // MUST MATCH BACKEND
+          items: checkoutItems.map((item) => ({
+            product: item.product._id,
+            qty: item.qty,
+          })),
+          shippingAddress,
+          paymentMethod,
+          total: totalPrice,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.message || "Order failed");
+
+      localStorage.removeItem("shippingAddress");
+      setBuyNowItem(null);
+
+      // Go to cart to see updated cart
+      navigate("/cart");
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setPlacingOrder(false);
+    }
+  };
+
+  /* ---------------- Razorpay Flow ---------------- */
   const payOnline = async () => {
     await loadRazorpay();
 
@@ -104,76 +174,12 @@ const Checkout = () => {
 
         if (!verifyRes.ok) return alert("Payment failed");
 
-        placeOrder(true);
+        // Place order only AFTER payment success
+        submitHandler({ preventDefault: () => {} });
       },
     };
 
     new window.Razorpay(options).open();
-  };
-
-  /* ---------------- Persist Address ---------------- */
-  useEffect(() => {
-    localStorage.setItem("shippingAddress", JSON.stringify(shippingAddress));
-  }, [shippingAddress]);
-
-  /* ---------------- Source of Truth ---------------- */
-  const checkoutItems = useMemo(() => {
-    if (buyNowItem) {
-      return [
-        {
-          product: buyNowItem.product,
-          qty: buyNowItem.qty,
-        },
-      ];
-    }
-    return cartItems;
-  }, [buyNowItem, cartItems]);
-
-  const itemsPrice = checkoutItems.reduce(
-    (sum, item) => sum + item.product.price * item.qty,
-    0
-  );
-
-  const shippingPrice = itemsPrice > 1000 ? 0 : 50;
-  const totalPrice = itemsPrice + shippingPrice;
-
-  /* ---------------- Submit Order ---------------- */
-  const submitHandler = async (e) => {
-    e.preventDefault();
-
-    if (checkoutItems.length === 0) return;
-
-    setPlacingOrder(true);
-
-    try {
-      const res = await fetch("http://localhost:5000/api/orders", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${user.token}`,
-        },
-        body: JSON.stringify({
-          orderItems: checkoutItems.map((item) => ({
-            product: item.product._id,
-            qty: item.qty,
-          })),
-          shippingAddress,
-          paymentMethod,
-          totalPrice,
-        }),
-      });
-
-      const order = await res.json();
-      if (!res.ok) throw new Error(order.message || "Order failed");
-
-      localStorage.removeItem("shippingAddress");
-      setBuyNowItem(null); // ✅ CRITICAL
-      navigate(`/order/${order._id}`);
-    } catch (err) {
-      alert(err.message);
-    } finally {
-      setPlacingOrder(false);
-    }
   };
 
   /* ---------------- UI STATES ---------------- */
@@ -253,8 +259,11 @@ const Checkout = () => {
         </label>
 
         <label className="radio">
-          <input type="radio" checked={paymentMethod==="Razorpay"}
-            onChange={()=>setPaymentMethod("Razorpay")}/>
+          <input
+            type="radio"
+            checked={paymentMethod === "Razorpay"}
+            onChange={() => setPaymentMethod("Razorpay")}
+          />
           Online Payment (Razorpay)
         </label>
 
@@ -292,19 +301,27 @@ const Checkout = () => {
           </div>
         </div>
 
-        <button
-          type="submit"
-          className="place-order-btn"
-          disabled={placingOrder}
-        >
-          {placingOrder ? "Placing Order…" : "Place Order"}
-        </button>
+        {paymentMethod === "Razorpay" ? (
+          <button
+            type="button"
+            className="place-order-btn"
+            disabled={placingOrder}
+            onClick={payOnline}
+          >
+            {placingOrder ? "Processing…" : "Pay Now"}
+          </button>
+        ) : (
+          <button
+            type="submit"
+            className="place-order-btn"
+            disabled={placingOrder}
+          >
+            {placingOrder ? "Placing Order…" : "Place Order"}
+          </button>
+        )}
       </form>
     </div>
   );
 };
 
 export default Checkout;
-
-
-

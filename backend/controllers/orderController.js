@@ -1,164 +1,185 @@
-const mongoose = require("mongoose");
-const Order = require("../models/Order");
+const User = require("../models/User");
 const Product = require("../models/Product");
+const Order = require("../models/Order");
 
-/* ---------------- CREATE ORDER ---------------- */
+/* =========================
+   CREATE ORDER
+   ========================= */
 const createOrder = async (req, res) => {
   try {
-    const { orderItems, shippingAddress, paymentMethod, totalPrice } = req.body;
+    // Accept both formats from frontend
+    const items = req.body.items || req.body.orderItems;
+    const { shippingAddress, paymentMethod, total, totalPrice } = req.body;
+    const finalTotal = total || totalPrice;
 
-    if (!orderItems || orderItems.length === 0) {
+    if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: "No order items" });
     }
 
-    if (!["COD", "Razorpay"].includes(paymentMethod)) {
-      return res.status(400).json({ message: "Invalid payment method" });
-    }
+    // Create order
+    const order = new Order({
+      user: req.user._id,
+      items,
+      shippingAddress,
+      paymentMethod,
+      total: finalTotal,
+      status: "PLACED",
+    });
 
-    const processedOrderItems = [];
+    await order.save();
 
-    for (const item of orderItems) {
-      if (!mongoose.Types.ObjectId.isValid(item.product)) {
-        return res.status(400).json({ message: "Invalid product ID" });
-      }
-
+    // Reduce stock
+    for (const item of items) {
       const product = await Product.findById(item.product);
+
       if (!product) {
         return res.status(404).json({ message: "Product not found" });
       }
 
-      processedOrderItems.push({
-        product: product._id,
-        name: product.name,
-        image: product.image,
-        price: product.price,
-        qty: item.qty,
-      });
+      if (product.stock < item.qty) {
+        return res.status(400).json({
+          message: `${product.name} has only ${product.stock} in stock`,
+        });
+      }
+
+      product.stock -= item.qty;
+      await product.save();
     }
 
-    const order = new Order({
-      user: req.user._id,
-      orderItems: processedOrderItems,
-      shippingAddress,
-      paymentMethod,
-      totalPrice,
-    });
+    // Remove ONLY ordered products from user's cart
+    const user = await User.findById(req.user._id);
 
-    const createdOrder = await order.save();
-    res.status(201).json(createdOrder);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    const orderedIds = items.map((i) => i.product.toString());
+
+    user.cartItems = user.cartItems.filter(
+      (item) => !orderedIds.includes(item.product.toString())
+    );
+
+    await user.save();
+
+    res.status(201).json({
+      success: true,
+      order,
+    });
+  } catch (err) {
+    console.error("CREATE ORDER ERROR:", err);
+    res.status(500).json({ message: "Order failed" });
   }
 };
 
+/* =========================
+   GET MY ORDERS
+   ========================= */
 const getMyOrders = async (req, res) => {
-  const orders = await Order.find({ user: req.user._id }).sort({
-    createdAt: -1,
-  });
-  res.json(orders);
+  try {
+    const orders = await Order.find({ user: req.user._id }).sort({
+      createdAt: -1,
+    });
+
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch orders" });
+  }
 };
 
+/* =========================
+   ADMIN — GET ALL ORDERS
+   ========================= */
 const getAllOrders = async (req, res) => {
   try {
-    const keyword = req.query.keyword
-      ? {
-          $or: [
-            { "user.name": { $regex: req.query.keyword, $options: "i" } },
-            { "user.email": { $regex: req.query.keyword, $options: "i" } },
-          ],
-        }
-      : {};
-
     const orders = await Order.find({})
       .populate("user", "name email")
       .sort({ createdAt: -1 });
 
     res.json(orders);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    res.status(500).json({ message: "Failed to fetch all orders" });
   }
 };
 
+/* =========================
+   GET ORDER BY ID
+   ========================= */
 const getOrderById = async (req, res) => {
-  const order = await Order.findById(req.params.id)
-    .populate("user", "name email")
-    .populate("orderItems.product", "name image");
-
-  if (!order) {
-    return res.status(404).json({ message: "Order not found" });
-  }
-
-  res.json(order);
-};
-
-const updateOrderToPaid = async (req, res) => {
-  const order = await Order.findById(req.params.id);
-
-  if (!order) {
-    return res.status(404).json({ message: "Order not found" });
-  }
-
-  order.isPaid = true;
-  order.paidAt = Date.now();
-
-  const updatedOrder = await order.save({ validateBeforeSave: false });
-  res.json(updatedOrder);
-};
-
-const updateOrderStatus = async (req, res) => {
   try {
-    const { status } = req.body;
+    const order = await Order.findById(req.params.id).populate(
+      "user",
+      "name email"
+    );
+
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch order" });
+  }
+};
+
+/* =========================
+   ADMIN — MARK AS PAID
+   ========================= */
+const updateOrderToPaid = async (req, res) => {
+  try {
     const order = await Order.findById(req.params.id);
 
     if (!order) {
       return res.status(404).json({ message: "Order not found" });
     }
 
-    if (order.isCancelled) {
-      return res.status(400).json({
-        message: "Cancelled orders cannot be updated",
-      });
-    }
-
-    const allowedTransitions = {
-      Pending: ["Processing"],
-      Processing: ["Shipped"],
-      Shipped: ["Delivered"],
-      Delivered: [],
+    order.isPaid = true;
+    order.paidAt = Date.now();
+    order.paymentResult = {
+      id: req.body.id,
+      status: req.body.status,
+      update_time: req.body.update_time,
+      email_address: req.body.email_address,
     };
 
-    if (!allowedTransitions[order.orderStatus].includes(status)) {
-      return res.status(400).json({
-        message: `Invalid transition from ${order.orderStatus} to ${status}`,
-      });
-    }
-
-    order.orderStatus = status;
-
-    if (status === "Shipped") {
-      order.shippedAt = new Date();
-    }
-
-    if (status === "Delivered") {
-      order.isDelivered = true;
-      order.deliveredAt = new Date();
-    }
-
-    await order.save();
-    res.json(order);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update payment status" });
   }
 };
 
+/* =========================
+   ADMIN — UPDATE STATUS
+   ========================= */
+const updateOrderStatus = async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    order.status = req.body.status || order.status;
+
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update order status" });
+  }
+};
+
+/* =========================
+   ADMIN — DELETE ORDER
+   ========================= */
 const deleteOrder = async (req, res) => {
-  const order = await Order.findById(req.params.id);
+  try {
+    const order = await Order.findById(req.params.id);
 
-  if (!order)
-    return res.status(404).json({ message: "Order not found" });
+    if (!order) {
+      return res.status(404).json({ message: "Order not found" });
+    }
 
-  await order.deleteOne();
-  res.json({ message: "Order deleted" });
+    await order.deleteOne();
+    res.json({ message: "Order deleted" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete order" });
+  }
 };
 
 module.exports = {
@@ -170,4 +191,3 @@ module.exports = {
   updateOrderStatus,
   deleteOrder,
 };
-
